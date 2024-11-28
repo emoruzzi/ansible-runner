@@ -32,6 +32,8 @@ import datetime
 import os
 import sys
 import uuid
+import re
+import random
 from copy import copy
 
 # Ansible
@@ -352,9 +354,60 @@ class CallbackModule(DefaultCallbackModule):
         # NOTE: Ansible doesn't generate a UUID for playbook_on_start so do it for them.
         self.playbook_uuid = str(uuid.uuid4())
 
+        # Add vault filtering functionality
+        self._filterPattern = None
+        self._mask = "null"
+        self._mask_list = [
+            "<CAKE_RECIPE_FOUND>",
+            "<BIRD_PROOF>",
+            "<FOR_SCIENCE>",
+            "<NEUROTOXIN>",
+            "<MATERIAL_EMANCIPATION_GRILL>",
+            "<SENTIENT_COMPANION_CUBE>",
+            "<RATTMANN_WAS_HERE>",
+            "<JACKPOT>",
+            "[HUGE_SUCCESS]"
+        ]
+
+        # Override the display so we can filter it before it's printed.
+        self._original_display = self._display.display
+        self._display.display = self._cake_display
+
+    # If we override the display, we can filter the 'msg' output for the regex pattern, passing it
+    # forward to the original display.
+    def _cake_display(self, msg, color=None, stderr=False, screen_only=False, log_only=False):
+        if self._filterPattern and msg:
+            msg = self._filterPattern.sub(self._mask , msg)
+
+        self._original_display(msg, color, stderr, screen_only, log_only)
+
+    def find_vault_keys(self, hostvar):
+        """Find and create pattern for vault variables to filter"""
+
+        filterWords = {
+            stripped
+            for item in hostvar
+            for h, v in hostvar[item].items()
+            if 'vault' in h.lower() and v
+            if (stripped := v.strip()) and len(stripped) >= 3
+        }
+        if filterWords:
+            self._filterPattern = re.compile("|".join(map(re.escape, filterWords)))
+
+    def _cake_results(self, data):
+            """Filter vault variables from result data"""
+            if isinstance(data, str):
+                return self._filterPattern.sub(self._mask, data)
+            if isinstance(data, dict):
+                return {k: self._cake_results(v) for k, v in data.items()}
+            if isinstance(data, list):
+                return [self._cake_results(item) for item in data]
+            return data
+
     @contextlib.contextmanager
     def capture_event_data(self, event, **event_data):
         event_data.setdefault('uuid', str(uuid.uuid4()))
+        event_data = self._cake_results(event_data)
 
         if event not in self.EVENTS_WITHOUT_TASK:
             task = event_data.pop('task', None)
@@ -454,6 +507,7 @@ class CallbackModule(DefaultCallbackModule):
         event_data = {
             'uuid': self.playbook_uuid,
         }
+
         with self.capture_event_data('playbook_on_start', **event_data):
             super().v2_playbook_on_start(playbook)
 
@@ -471,6 +525,7 @@ class CallbackModule(DefaultCallbackModule):
             'default': default,
             'unsafe': unsafe,
         }
+
         with self.capture_event_data('playbook_on_vars_prompt', **event_data):
             super().v2_playbook_on_vars_prompt(
                 varname, private, prompt, encrypt, confirm, salt_size, salt,
@@ -502,6 +557,7 @@ class CallbackModule(DefaultCallbackModule):
                 play_uuid,
                 str(self.duplicate_play_counts[play_uuid])
             ])
+
         self.play_uuids.add(play_uuid)
         play._uuid = play_uuid
 
@@ -519,6 +575,12 @@ class CallbackModule(DefaultCallbackModule):
             'pattern': pattern,
             'uuid': str(play._uuid),
         }
+
+        # assume we haven't found the keys yet..
+        if self._mask == "null":
+            self._mask = random.choice(self._mask_list)
+            self.find_vault_keys(play._variable_manager.get_vars()['hostvars'])
+
         with self.capture_event_data('playbook_on_play_start', **event_data):
             super().v2_playbook_on_play_start(play)
 
